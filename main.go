@@ -14,9 +14,13 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	kingpin "github.com/alecthomas/kingpin/v2"
@@ -49,8 +53,10 @@ func (i *SMARTctlManagerCollector) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect is called by the Prometheus registry when collecting metrics.
 func (i *SMARTctlManagerCollector) Collect(ch chan<- prometheus.Metric) {
-	info := NewSMARTctlInfo(ch)
 	i.mutex.Lock()
+	defer i.mutex.Unlock()
+
+	info := NewSMARTctlInfo(ch)
 	for _, device := range i.Devices {
 		json := readData(i.logger, device)
 		if json.Exists() {
@@ -65,17 +71,25 @@ func (i *SMARTctlManagerCollector) Collect(ch chan<- prometheus.Metric) {
 		float64(len(i.Devices)),
 	)
 	info.Collect()
-	i.mutex.Unlock()
 }
 
-func (i *SMARTctlManagerCollector) RescanForDevices() {
+func (i *SMARTctlManagerCollector) RescanForDevices(ctx context.Context) error {
+	timer := time.NewTimer(*smartctlRescanInterval)
+	defer timer.Stop()
+
 	for {
-		time.Sleep(*smartctlRescanInterval)
-		level.Info(i.logger).Log("msg", "Rescanning for devices")
-		devices := scanDevices(i.logger)
-		i.mutex.Lock()
-		i.Devices = devices
-		i.mutex.Unlock()
+		select {
+		case <-ctx.Done():
+			err := ctx.Err()
+			level.Info(i.logger).Log("msg", "Stop rescanning for devices because the context is end", "err", err)
+			return err
+		case <-timer.C:
+			level.Info(i.logger).Log("msg", "Rescanning for devices")
+			devices := scanDevices(i.logger)
+			i.mutex.Lock()
+			i.Devices = devices
+			i.mutex.Unlock()
+		}
 	}
 }
 
@@ -110,9 +124,9 @@ func scanDevices(logger log.Logger) []string {
 	filter := newDeviceFilter(*smartctlDeviceExclude, *smartctlDeviceInclude)
 
 	json := readSMARTctlDevices(logger)
-	scanDevices := json.Get("devices").Array()
+	devices := json.Get("devices").Array()
 	var scanDeviceResult []string
-	for _, d := range scanDevices {
+	for _, d := range devices {
 		deviceName := d.Get("name").String()
 		if filter.ignored(deviceName) {
 			level.Info(logger).Log("msg", "Ignoring device", "name", deviceName)
@@ -154,10 +168,17 @@ func main() {
 		logger:  logger,
 	}
 
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
+	defer cancel()
+
 	if *smartctlRescanInterval >= 1*time.Second && len(*smartctlDevices) == 0 {
 		level.Info(logger).Log("msg", "Start background scan process")
 		level.Info(logger).Log("msg", "Rescanning for devices every", "rescanInterval", *smartctlRescanInterval)
-		go collector.RescanForDevices()
+		go func() {
+			if err := collector.RescanForDevices(ctx); !noError(err) {
+				level.Error(logger).Log("msg", "Rescanning for devices function exit with error", "err", err)
+			}
+		}()
 	}
 
 	reg := prometheus.NewPedanticRegistry()
@@ -191,8 +212,29 @@ func main() {
 	}
 
 	srv := &http.Server{}
-	if err := web.ListenAndServe(srv, toolkitFlags, logger); err != nil {
+	go func() {
+		if err := web.ListenAndServe(srv, toolkitFlags, logger); !noError(err) {
+			level.Error(logger).Log("msg", "ListenAndServe function exit with error", "err", err)
+		}
+	}()
+
+	<-ctx.Done()
+
+	srvShutdownCtx, srvShutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer srvShutdownCancel()
+	err := srv.Shutdown(srvShutdownCtx)
+	if err == nil {
+		err = ctx.Err()
+	}
+
+	if !noError(err) {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)
 	}
+}
+
+func noError(err error) bool {
+	return err == nil ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, http.ErrServerClosed)
 }
